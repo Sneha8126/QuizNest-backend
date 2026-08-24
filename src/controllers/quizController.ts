@@ -1,19 +1,150 @@
+import { Request, Response } from 'express';
+import { Quiz } from '../models/Quiz';
+import { Attempt } from '../models/Attempt';
+import { ApiError } from '../middleware/errorHandler';
+import {
+  generateQuizSchema,
+  updateQuizSchema,
+} from '../utils/validation';
+import { generateQuestionsFromDocument } from '../services/aiServiceClient';
+import { env } from '../config/env';
+import { StoredDocument } from '../models/Document';
 
-  return res.json({ quiz: safeQuiz });
+// ============================================================
+// QUIZ GENERATION
+// ============================================================
+
+export async function generateQuiz(
+  req: Request,
+  res: Response
+) {
+  const body = generateQuizSchema.parse(req.body);
+
+  const document = await StoredDocument.findOne({
+    _id: body.documentId,
+    ownerId: req.user!.userId,
+  });
+
+  if (!document) {
+    throw new ApiError(
+      404,
+      'Uploaded document not found or you do not own it. Upload it again.'
+    );
+  }
+
+  const questions = await generateQuestionsFromDocument({
+    documentBuffer: document.data,
+    documentName: document.originalName,
+    mimeType: document.mimeType,
+    numQuestions: body.settings.numQuestions,
+    difficulty: body.settings.difficulty,
+    questionType: body.settings.questionType,
+  });
+
+  const quiz = await Quiz.create({
+    title: body.title,
+    description: body.description || '',
+    creatorId: req.user!.userId,
+    sourceDocument: {
+      originalName: document.originalName,
+      mimeType: document.mimeType,
+      sizeBytes: document.sizeBytes,
+    },
+    questions,
+    settings: body.settings,
+
+    // Published directly because this app is for
+    // student preparation and attempting.
+    status: 'published',
+  });
+
+  // The document is only needed while generating the quiz.
+  await document.deleteOne();
+
+  res.status(201).json({ quiz });
 }
 
-/**
- * Get a quiz specifically for attempting.
- *
- * This endpoint NEVER returns:
- * - correctAnswer
- * - expectedAnswer
- * - keyConcepts
- * - explanation
- *
- * This is important even when the quiz creator is attempting
- * their own published quiz.
- */
+// ============================================================
+// MY QUIZZES
+// ============================================================
+
+export async function listMyQuizzes(
+  req: Request,
+  res: Response
+) {
+  const quizzes = await Quiz.find({
+    creatorId: req.user!.userId,
+  }).sort({ createdAt: -1 });
+
+  const withStats = await Promise.all(
+    quizzes.map(async (quiz) => {
+      const attemptsCount = await Attempt.countDocuments({
+        quizId: quiz._id,
+      });
+
+      return {
+        ...quiz.toJSON(),
+        attemptsCount,
+      };
+    })
+  );
+
+  res.json({ quizzes: withStats });
+}
+
+// ============================================================
+// GET QUIZ
+//
+// Participants receive a safe quiz without answer keys.
+// ============================================================
+
+export async function getQuiz(
+  req: Request,
+  res: Response
+) {
+  const quiz = await Quiz.findById(req.params.id);
+
+  if (!quiz) {
+    throw new ApiError(404, 'Quiz not found');
+  }
+
+  if (quiz.status !== 'published') {
+    throw new ApiError(
+      403,
+      'This quiz is not available'
+    );
+  }
+
+  const safeQuiz = quiz.toJSON() as any;
+
+  safeQuiz.questions = safeQuiz.questions.map(
+    (q: any) => ({
+      _id: q._id ?? q.id,
+      questionText: q.questionText,
+      type: q.type,
+      options: q.options,
+      difficulty: q.difficulty,
+      topic: q.topic,
+      marks: q.marks,
+      negativeMarks: q.negativeMarks,
+    })
+  );
+
+  return res.json({
+    quiz: safeQuiz,
+  });
+}
+
+// ============================================================
+// GET QUIZ FOR ATTEMPT
+//
+// NEVER sends:
+// - correctAnswer
+// - expectedAnswer
+// - keyConcepts
+// - explanation
+// ============================================================
+
 export async function getQuizForAttempt(
   req: Request,
   res: Response
@@ -33,31 +164,46 @@ export async function getQuizForAttempt(
 
   const safeQuiz = quiz.toJSON() as any;
 
-  safeQuiz.questions = safeQuiz.questions.map((q: any) => ({
-    _id: q._id ?? q.id,
-    questionText: q.questionText,
-    type: q.type,
-    options: q.options,
-    difficulty: q.difficulty,
-    topic: q.topic,
-    marks: q.marks,
-    negativeMarks: q.negativeMarks,
-  }));
+  safeQuiz.questions = safeQuiz.questions.map(
+    (q: any) => ({
+      _id: q._id ?? q.id,
+      questionText: q.questionText,
+      type: q.type,
+      options: q.options,
+      difficulty: q.difficulty,
+      topic: q.topic,
+      marks: q.marks,
+      negativeMarks: q.negativeMarks,
+    })
+  );
 
   return res.json({
     quiz: safeQuiz,
   });
 }
 
-export async function updateQuiz(req: Request, res: Response) {
+// ============================================================
+// UPDATE QUIZ
+// ============================================================
+
+export async function updateQuiz(
+  req: Request,
+  res: Response
+) {
   const quiz = await Quiz.findById(req.params.id);
 
   if (!quiz) {
     throw new ApiError(404, 'Quiz not found');
   }
 
-  if (quiz.creatorId.toString() !== req.user!.userId) {
-    throw new ApiError(403, 'You do not own this quiz');
+  if (
+    quiz.creatorId.toString() !==
+    req.user!.userId
+  ) {
+    throw new ApiError(
+      403,
+      'You do not own this quiz'
+    );
   }
 
   const body = updateQuizSchema.parse(req.body);
@@ -83,21 +229,38 @@ export async function updateQuiz(req: Request, res: Response) {
   res.json({ quiz });
 }
 
-export async function deleteQuiz(req: Request, res: Response) {
+// ============================================================
+// DELETE QUIZ
+// ============================================================
+
+export async function deleteQuiz(
+  req: Request,
+  res: Response
+) {
   const quiz = await Quiz.findById(req.params.id);
 
   if (!quiz) {
     throw new ApiError(404, 'Quiz not found');
   }
 
-  if (quiz.creatorId.toString() !== req.user!.userId) {
-    throw new ApiError(403, 'You do not own this quiz');
+  if (
+    quiz.creatorId.toString() !==
+    req.user!.userId
+  ) {
+    throw new ApiError(
+      403,
+      'You do not own this quiz'
+    );
   }
 
   await quiz.deleteOne();
 
   res.status(204).send();
 }
+
+// ============================================================
+// VALIDATE QUESTIONS
+// ============================================================
 
 function validateQuestionsForPublish(
   questions: any[]
@@ -177,6 +340,10 @@ function validateQuestionsForPublish(
   return null;
 }
 
+// ============================================================
+// PUBLISH QUIZ
+// ============================================================
+
 export async function publishQuiz(
   req: Request,
   res: Response
@@ -187,8 +354,14 @@ export async function publishQuiz(
     throw new ApiError(404, 'Quiz not found');
   }
 
-  if (quiz.creatorId.toString() !== req.user!.userId) {
-    throw new ApiError(403, 'You do not own this quiz');
+  if (
+    quiz.creatorId.toString() !==
+    req.user!.userId
+  ) {
+    throw new ApiError(
+      403,
+      'You do not own this quiz'
+    );
   }
 
   if (quiz.questions.length === 0) {
@@ -199,10 +372,15 @@ export async function publishQuiz(
   }
 
   const questionError =
-    validateQuestionsForPublish(quiz.questions);
+    validateQuestionsForPublish(
+      quiz.questions
+    );
 
   if (questionError) {
-    throw new ApiError(400, questionError);
+    throw new ApiError(
+      400,
+      questionError
+    );
   }
 
   quiz.status = 'published';
@@ -216,6 +394,10 @@ export async function publishQuiz(
   });
 }
 
+// ============================================================
+// CLOSE QUIZ
+// ============================================================
+
 export async function closeQuiz(
   req: Request,
   res: Response
@@ -226,8 +408,14 @@ export async function closeQuiz(
     throw new ApiError(404, 'Quiz not found');
   }
 
-  if (quiz.creatorId.toString() !== req.user!.userId) {
-    throw new ApiError(403, 'You do not own this quiz');
+  if (
+    quiz.creatorId.toString() !==
+    req.user!.userId
+  ) {
+    throw new ApiError(
+      403,
+      'You do not own this quiz'
+    );
   }
 
   quiz.status = 'closed';
@@ -236,6 +424,10 @@ export async function closeQuiz(
 
   res.json({ quiz });
 }
+
+// ============================================================
+// DUPLICATE QUIZ
+// ============================================================
 
 export async function duplicateQuiz(
   req: Request,
@@ -247,8 +439,14 @@ export async function duplicateQuiz(
     throw new ApiError(404, 'Quiz not found');
   }
 
-  if (quiz.creatorId.toString() !== req.user!.userId) {
-    throw new ApiError(403, 'You do not own this quiz');
+  if (
+    quiz.creatorId.toString() !==
+    req.user!.userId
+  ) {
+    throw new ApiError(
+      403,
+      'You do not own this quiz'
+    );
   }
 
   const copy = await Quiz.create({
@@ -266,10 +464,12 @@ export async function duplicateQuiz(
   });
 }
 
-/**
- * Builds a small practice quiz by pulling questions the user previously got
- * wrong or that belong to their weak topics.
- */
+// ============================================================
+// GENERATE PRACTICE QUIZ
+//
+// Creates targeted practice from the student's weak topics.
+// ============================================================
+
 export async function generatePracticeQuiz(
   req: Request,
   res: Response
@@ -292,7 +492,9 @@ export async function generatePracticeQuiz(
 
   const quizIds = [
     ...new Set(
-      attempts.map((a) => a.quizId.toString())
+      attempts.map((a) =>
+        a.quizId.toString()
+      )
     ),
   ];
 
@@ -303,13 +505,18 @@ export async function generatePracticeQuiz(
   });
 
   const topicSet = new Set(
-    topics.map((t) => t.toLowerCase())
+    topics.map((t) =>
+      t.toLowerCase()
+    )
   );
 
   const pool = quizzes.flatMap((q) =>
     q.questions.filter((question) =>
       topicSet.has(
-        (question.topic || 'General').toLowerCase()
+        (
+          question.topic ||
+          'General'
+        ).toLowerCase()
       )
     )
   );
@@ -349,12 +556,17 @@ export async function generatePracticeQuiz(
   });
 }
 
+// ============================================================
+// GET PUBLIC QUIZ BY SHARE CODE
+// ============================================================
+
 export async function getQuizByCode(
   req: Request,
   res: Response
 ) {
   const quiz = await Quiz.findOne({
-    shareCode: req.params.code.toUpperCase(),
+    shareCode:
+      req.params.code.toUpperCase(),
   });
 
   if (
@@ -367,23 +579,25 @@ export async function getQuizByCode(
     );
   }
 
-  // Participants shouldn't see correct answers before attempting.
+  // Participants shouldn't see correct answers
+  // before attempting.
   const safeQuiz = quiz.toJSON() as any;
 
-  safeQuiz.questions = safeQuiz.questions.map(
-    (q: any) => ({
-      _id: q._id ?? q.id,
-      questionText: q.questionText,
-      type: q.type,
-      options: q.options,
-      difficulty: q.difficulty,
-      topic: q.topic,
-      marks: q.marks,
-      negativeMarks: q.negativeMarks,
-    })
-  );
+  safeQuiz.questions =
+    safeQuiz.questions.map(
+      (q: any) => ({
+        _id: q._id ?? q.id,
+        questionText: q.questionText,
+        type: q.type,
+        options: q.options,
+        difficulty: q.difficulty,
+        topic: q.topic,
+        marks: q.marks,
+        negativeMarks: q.negativeMarks,
+      })
+    );
 
   res.json({
     quiz: safeQuiz,
   });
-    }
+}
